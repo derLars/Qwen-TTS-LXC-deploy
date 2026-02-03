@@ -26,7 +26,7 @@ apt-get install -y \
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
-    log "[2/6] NVIDIA GPU and driver detected. Installing CUDA Toolkit."
+    log "[2/6] NVIDIA GPU and driver detected. Installing CUDA Toolkit and GPU-enabled PyTorch."
     
     # Enable contrib, non-free and non-free-firmware repositories
     sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
