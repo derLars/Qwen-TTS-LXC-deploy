@@ -25,8 +25,18 @@ apt-get install -y \
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
     log "[2/6] NVIDIA GPU detected. Installing CUDA and GPU-enabled PyTorch."
-    # This is a simplified CUDA installation. It might need to be adjusted for specific distributions.
-    apt-get install -y nvidia-driver-525 nvidia-cuda-toolkit
+    apt-get install -y software-properties-common
+    add-apt-repository contrib
+    add-apt-repository non-free
+    apt-get update
+    apt-get install -y nvidia-driver firmware-misc-nonfree
+    
+    # Add NVIDIA CUDA repository
+    wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
+    dpkg -i cuda-keyring_1.0-1_all.deb
+    apt-get update
+    apt-get -y install cuda-toolkit-11-8
+    
     export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
     PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
 else
