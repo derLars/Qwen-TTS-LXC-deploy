@@ -18,8 +18,6 @@ log "=== Starting Qwen3-TTS Server Installation/Update ==="
 # --- System Dependencies ---
 log "[1/6] Installing system dependencies..."
 apt-get update
-# The package 'software-properties-common' is not available in Debian 12/13 minimal installations.
-# The 'add-apt-repository' command is not needed as we are managing sources manually.
 apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
     build-essential ffmpeg libsndfile1 git wget curl
@@ -35,6 +33,7 @@ if command -v nvidia-smi &> /dev/null; then
     apt-get install -y nvidia-driver firmware-misc-nonfree
     
     # Add NVIDIA CUDA repository
+    # The debian11 repo is the latest one provided by NVIDIA that works for debian12+
     wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
     dpkg -i cuda-keyring_1.0-1_all.deb
     rm cuda-keyring_1.0-1_all.deb
