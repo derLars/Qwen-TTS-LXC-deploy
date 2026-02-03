@@ -33,13 +33,16 @@ if command -v nvidia-smi &> /dev/null; then
     
     apt-get update
     
+    echo "Acquire::AllowInsecureRepositories \"true\";" > /etc/apt/apt.conf.d/99-allow-insecure-repositories
+    echo "Acquire::AllowDowngradeToInsecureRepositories \"true\";" >> /etc/apt/apt.conf.d/99-allow-insecure-repositories
+
     # Add NVIDIA CUDA repository
     # The debian11 repo is the latest one provided by NVIDIA that works for debian12+
     wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
     dpkg -i cuda-keyring_1.0-1_all.deb
     rm cuda-keyring_1.0-1_all.deb
     apt-get update
-    apt-get -y install cuda-toolkit-11-8
+    apt-get -y --allow-unauthenticated install cuda-toolkit-11-8
     
     export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
     PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
