@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+torch
+torchaudio
+soundfile
+scipy
+numpy
+accelerate
+transformers>=4.48.0
+git+https://github.com/QwenLM/Qwen3-TTS.git
