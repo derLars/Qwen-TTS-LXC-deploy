@@ -3,59 +3,72 @@
 # Exit on error
 set -e
 
-echo "=== Starting Qwen3-TTS Server Installation (LXC/Debian) ==="
+# --- Configuration ---
+APP_DIR="/opt/qwen-tts-server"
+GITHUB_REPO="https://github.com/derlars/Qwen-TTS-LXC-deploy/raw/main"
+SERVICE_FILE="/etc/systemd/system/qwen-tts.service"
 
-# 1. Update and install system dependencies
-echo "[1/5] Installing system dependencies..."
+# --- Logging ---
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] - $1"
+}
+
+log "=== Starting Qwen3-TTS Server Installation/Update ==="
+
+# --- System Dependencies ---
+log "[1/6] Installing system dependencies..."
 apt-get update
 apt-get install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    python3-dev \
-    build-essential \
-    ffmpeg \
-    libsndfile1 \
-    git \
-    wget
+    python3 python3-pip python3-venv python3-dev \
+    build-essential ffmpeg libsndfile1 git wget curl
 
-# 2. Create Application Directory
-APP_DIR="/opt/qwen-tts-server"
-echo "[2/5] Creating application directory at $APP_DIR..."
-mkdir -p $APP_DIR
-# Assuming server.py and requirements.txt are in the current directory, move them
-# If running this script from the same folder as the source files:
-if [ -f "server.py" ]; then
-    cp server.py $APP_DIR/
+# --- GPU Detection and PyTorch Installation ---
+if command -v nvidia-smi &> /dev/null; then
+    log "[2/6] NVIDIA GPU detected. Installing CUDA and GPU-enabled PyTorch."
+    # This is a simplified CUDA installation. It might need to be adjusted for specific distributions.
+    apt-get install -y nvidia-driver-525 nvidia-cuda-toolkit
+    export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
+    PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+else
+    log "[2/6] No NVIDIA GPU detected. Using CPU-only PyTorch."
+    PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu"
 fi
-if [ -f "requirements.txt" ]; then
-    cp requirements.txt $APP_DIR/
+
+# --- Application Directory and Update Logic ---
+if [ -d "$APP_DIR" ]; then
+    log "[3/6] Existing installation found. Stopping server and updating files."
+    systemctl stop qwen-tts || true
+    # Backup old files
+    mv $APP_DIR/server.py $APP_DIR/server.py.bak || true
+    mv $APP_DIR/requirements.txt $APP_DIR/requirements.txt.bak || true
+    mv $APP_DIR/config.yaml $APP_DIR/config.yaml.bak || true
+else
+    log "[3/6] No existing installation found. Creating application directory."
+    mkdir -p $APP_DIR
 fi
 
 cd $APP_DIR
+mkdir -p logs
 
-# 3. Set up Python Virtual Environment
-echo "[3/5] Creating virtual environment..."
-python3 -m venv venv
-source venv/bin/activate
+# --- Download Application Files ---
+log "[4/6] Downloading application files from GitHub..."
+wget -q -O $APP_DIR/server.py $GITHUB_REPO/server.py
+wget -q -O $APP_DIR/requirements.txt $GITHUB_REPO/requirements.txt
+wget -q -O $APP_DIR/config.yaml $GITHUB_REPO/config.yaml
 
-# Upgrade pip
-pip install --upgrade pip
-
-# 4. Install Python Libraries
-echo "[4/5] Installing Python requirements..."
-if [ -f "requirements.txt" ]; then
-    pip install -r requirements.txt
-else
-    echo "Error: requirements.txt not found in $APP_DIR."
-    exit 1
+# --- Python Virtual Environment and Dependencies ---
+if [ ! -d "$APP_DIR/venv" ]; then
+    log "[5/6] Creating Python virtual environment."
+    python3 -m venv venv
 fi
+source venv/bin/activate
+pip install --upgrade pip
+log "[5/6] Installing Python requirements..."
+$PIP_INSTALL_TORCH
+pip install -r requirements.txt --no-cache-dir
 
-# 5. Create Systemd Service for Auto-Start
-echo "[5/5] Configuring Systemd Service..."
-
-SERVICE_FILE="/etc/systemd/system/qwen-tts.service"
-
+# --- Systemd Service ---
+log "[6/6] Configuring and starting Systemd service..."
 cat <<EOF > $SERVICE_FILE
 [Unit]
 Description=Qwen3-TTS API Server
@@ -64,8 +77,7 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=$APP_DIR
-Environment="PATH=$APP_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=$APP_DIR/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
+ExecStart=$APP_DIR/venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 7200
 Restart=always
 RestartSec=5
 
@@ -73,15 +85,11 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# Reload systemd to recognize the new service
 systemctl daemon-reload
-
-# Enable the service to start on boot
 systemctl enable qwen-tts
+systemctl restart qwen-tts
 
-# Start the service immediately
-systemctl start qwen-tts
-
-echo "=== Installation Complete ==="
-echo "The service is now running and will start automatically on boot."
-echo "Check status with: systemctl status qwen-tts"
+log "=== Installation/Update Complete ==="
+log "The service is now running and will start automatically on boot."
+log "Check status with: systemctl status qwen-tts"
+log "Logs are available at: $APP_DIR/logs/server.log and via journalctl -u qwen-tts"

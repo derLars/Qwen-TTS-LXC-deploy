@@ -9,3 +9,5 @@ numpy
 accelerate
 transformers>=4.48.0
 git+https://github.com/QwenLM/Qwen3-TTS.git
+PyYAML
+loguru
