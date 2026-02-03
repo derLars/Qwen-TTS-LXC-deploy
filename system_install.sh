@@ -26,6 +26,12 @@ apt-get install -y \
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
+
+    log "[2/6] Forcibly removing conflicting NVIDIA packages..."
+    dpkg --remove --force-remove-reinstreq nvidia-installer-cleanup || true
+    apt-get remove --purge '^nvidia-.*' -y || true
+    apt-get autoremove -y || true
+
     log "[2/6] NVIDIA GPU detected. Installing CUDA and GPU-enabled PyTorch."
     
     # Enable contrib, non-free and non-free-firmware repositories
