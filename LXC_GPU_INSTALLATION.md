@@ -26,12 +26,14 @@ The updated `system_install.sh` now **intelligently detects** your environment a
 - Maintains backward compatibility
 
 ### Supported GPU Architectures
-- **RTX 50-series (Blackwell)**: sm_120 → CUDA 12.4 PyTorch ✅
-- **RTX 40-series (Ada Lovelace)**: sm_89 → CUDA 12.4 PyTorch ✅
-- **H100/A100 (Hopper/Ampere)**: sm_90/sm_80 → CUDA 12.4/11.8 PyTorch ✅
-- **RTX 30-series (Ampere)**: sm_86 → CUDA 11.8 PyTorch ✅
-- **RTX 20-series (Turing)**: sm_75 → CUDA 11.8 PyTorch ✅
-- **GTX 10-series (Pascal)**: sm_61 → CUDA 11.8 PyTorch ✅
+- **RTX 50-series (Blackwell)**: sm_120 → **PyTorch Nightly CUDA 12.9** ✅
+- **RTX 40-series (Ada Lovelace)**: sm_89 → PyTorch Stable CUDA 12.4 ✅
+- **H100 (Hopper)**: sm_90 → PyTorch Stable CUDA 12.4 ✅
+- **RTX 30-series (Ampere)**: sm_86 → PyTorch Stable CUDA 11.8 ✅
+- **RTX 20-series (Turing)**: sm_75 → PyTorch Stable CUDA 11.8 ✅
+- **GTX 10-series (Pascal)**: sm_61 → PyTorch Stable CUDA 11.8 ✅
+
+**Note**: RTX 50-series requires PyTorch nightly builds as stable releases don't yet support sm_120.
 
 ## How to Install
 

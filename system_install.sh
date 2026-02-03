@@ -58,10 +58,17 @@ if command -v nvidia-smi &> /dev/null; then
             CAP_MINOR=$(echo "$COMPUTE_CAP" | cut -d'.' -f2)
             CAP_INT=$((CAP_MAJOR * 10 + CAP_MINOR))
             
-            # sm_90+ (Ada Lovelace/Hopper/Blackwell) requires PyTorch CUDA 12.x
-            if [ "$CAP_INT" -ge 90 ]; then
+            # sm_120+ (RTX 50-series Blackwell) requires PyTorch nightly with CUDA 12.9
+            if [ "$CAP_INT" -ge 120 ]; then
+                log "  Detected RTX 50-series (Blackwell sm_${CAP_MAJOR}${CAP_MINOR})"
+                log "  Installing PyTorch NIGHTLY with CUDA 12.9 (required for sm_120+ support)..."
+                log "  Note: Stable PyTorch does not yet support Blackwell architecture"
+                export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
+                PIP_INSTALL_TORCH="pip install --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu129"
+            # sm_90-119 (Ada Lovelace/Hopper) uses PyTorch stable with CUDA 12.4
+            elif [ "$CAP_INT" -ge 90 ]; then
                 log "  Detected modern GPU architecture (sm_${CAP_MAJOR}${CAP_MINOR})"
-                log "  Installing PyTorch with CUDA 12.4 support (for Ada/Hopper/Blackwell GPUs)..."
+                log "  Installing PyTorch with CUDA 12.4 support (for Ada/Hopper GPUs)..."
                 export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
                 PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124"
             else

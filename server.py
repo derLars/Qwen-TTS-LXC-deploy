@@ -109,12 +109,26 @@ async def inactivity_monitor():
 def process_audio_output(outputs):
     """
     Helper to extract audio and sample rate safely from model outputs.
+    Handles both dict and tuple return formats for compatibility.
     """
-    audio_data, sample_rate = outputs["audio"], outputs["sample_rate"]
+    # Handle different output formats
+    if isinstance(outputs, dict):
+        # Dictionary format (older API)
+        audio_data = outputs["audio"]
+        sample_rate = outputs["sample_rate"]
+    elif isinstance(outputs, (tuple, list)):
+        # Tuple/list format (newer API)
+        audio_data = outputs[0]
+        sample_rate = outputs[1] if len(outputs) > 1 else 12000  # Default to 12kHz if not provided
+    else:
+        logger.error(f"Unexpected output type from model: {type(outputs)}")
+        raise TypeError(f"Model returned unexpected output type: {type(outputs)}")
 
+    # Convert tensor to numpy if needed
     if isinstance(audio_data, torch.Tensor):
         audio_data = audio_data.detach().cpu().float().numpy()
     
+    # Squeeze extra dimensions if present
     if isinstance(audio_data, np.ndarray) and audio_data.ndim > 1:
         audio_data = audio_data.squeeze()
         

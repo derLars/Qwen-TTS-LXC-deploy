@@ -121,10 +121,12 @@ All endpoints listen on `http://0.0.0.0:8000`
 
 ### Intelligent GPU Detection
 The script automatically detects:
-- **RTX 50-series (Blackwell - sm_120)** → Installs PyTorch CUDA 12.4
-- **RTX 40-series (Ada - sm_89)** → Installs PyTorch CUDA 12.4
-- **RTX 30-series (Ampere - sm_86)** → Installs PyTorch CUDA 11.8
+- **RTX 50-series (Blackwell - sm_120)** → Installs **PyTorch Nightly CUDA 12.9** (bleeding edge)
+- **RTX 40-series (Ada - sm_89)** → Installs PyTorch Stable CUDA 12.4
+- **RTX 30-series (Ampere - sm_86)** → Installs PyTorch Stable CUDA 11.8
 - **Older GPUs** → Installs appropriate PyTorch version
+
+**Note**: RTX 50-series GPUs require PyTorch nightly builds as stable releases don't yet support sm_120.
 
 ### LXC Container Optimization
 - Skips CUDA toolkit when libraries are already available via passthrough
