@@ -32,7 +32,12 @@ if command -v nvidia-smi &> /dev/null; then
     sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
     
     apt-get update
-    apt-get install -y nvidia-driver firmware-misc-nonfree
+    if ! dpkg -l | grep -q nvidia-driver; then
+        log "No existing NVIDIA driver found. Installing Debian package."
+        apt-get install -y nvidia-driver firmware-misc-nonfree
+    else
+        log "Existing NVIDIA driver found. Skipping installation."
+    fi
     
     # Add NVIDIA CUDA repository
     # The debian11 repo is the latest one provided by NVIDIA that works for debian12+
