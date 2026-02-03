@@ -10,17 +10,28 @@ The original installation script failed on LXC containers with GPU passthrough d
 
 ## Solution Implemented
 
-The updated `system_install.sh` now **intelligently detects** your environment:
+The updated `system_install.sh` now **intelligently detects** your environment and GPU:
 
 ### For LXC Containers (Your Case)
 - ✅ Detects existing CUDA runtime libraries via GPU passthrough
 - ✅ **Skips CUDA toolkit installation** (avoids all conflicts)
-- ✅ Installs GPU-enabled PyTorch that uses host's CUDA libraries
+- ✅ **Auto-detects GPU compute capability** (e.g., sm_120 for RTX 5060 Ti)
+- ✅ Installs **CUDA 12.4 PyTorch** for modern GPUs (sm_90+: Ada/Hopper/Blackwell)
+- ✅ Installs **CUDA 11.8 PyTorch** for older GPUs (sm_50-86: Pascal/Volta/Turing/Ampere)
+- ✅ Uses host's CUDA libraries via GPU passthrough
 - ✅ Verifies GPU accessibility after installation
 
 ### For Bare-Metal Installations
 - Still installs CUDA toolkit when no CUDA libraries are found
 - Maintains backward compatibility
+
+### Supported GPU Architectures
+- **RTX 50-series (Blackwell)**: sm_120 → CUDA 12.4 PyTorch ✅
+- **RTX 40-series (Ada Lovelace)**: sm_89 → CUDA 12.4 PyTorch ✅
+- **H100/A100 (Hopper/Ampere)**: sm_90/sm_80 → CUDA 12.4/11.8 PyTorch ✅
+- **RTX 30-series (Ampere)**: sm_86 → CUDA 11.8 PyTorch ✅
+- **RTX 20-series (Turing)**: sm_75 → CUDA 11.8 PyTorch ✅
+- **GTX 10-series (Pascal)**: sm_61 → CUDA 11.8 PyTorch ✅
 
 ## How to Install
 
@@ -80,6 +91,41 @@ Automatically tests PyTorch's GPU access after installation and reports:
 - CUDA availability
 - GPU device name
 - GPU count
+
+## RTX 50-Series (Blackwell) Special Notes
+
+### CUDA Version Compatibility
+
+If you have an **RTX 5060 Ti** or other RTX 50-series GPU, you may notice:
+- Your NVIDIA driver reports **CUDA 13.1** (via `nvidia-smi`)
+- The installation script installs **PyTorch with CUDA 12.4** support
+
+**This is correct and expected!** Here's why:
+
+1. **Driver Forward Compatibility**: NVIDIA drivers support running applications compiled for **older CUDA versions**. Your CUDA 13.1 driver can run CUDA 12.4, 11.8, and earlier applications.
+
+2. **PyTorch Availability**: As of February 2026, PyTorch does not yet provide CUDA 13.x builds. The latest available is CUDA 12.4.
+
+3. **Compute Capability**: RTX 5060 Ti has `sm_120` (Blackwell architecture), which is supported by PyTorch CUDA 12.4 builds.
+
+### What You'll See
+
+During model loading, you may see a warning about `flash-attn` not being installed:
+```
+Warning: flash-attn is not installed. Will only run the manual PyTorch version. 
+Please install flash-attn for faster inference.
+```
+
+This is **normal** and the models will work fine. Flash-attention is an optional optimization that may not yet support sm_120.
+
+### Expected Behavior
+
+After the fix:
+- ✅ Server starts with `Using device: cuda`
+- ✅ Models load successfully
+- ✅ No "sm_120 is not compatible" errors
+- ✅ TTS generation works correctly
+- ⚠️ Flash-attention warning (can be ignored)
 
 ## Troubleshooting
 

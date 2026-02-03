@@ -28,20 +28,53 @@ apt-get install -y \
 if command -v nvidia-smi &> /dev/null; then
     log "[2/6] NVIDIA GPU detected."
     
+    # Detect GPU compute capability for PyTorch CUDA version selection
+    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '[:space:]')
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)
+    
     # Check if CUDA runtime libraries are already available (LXC/container with GPU passthrough)
     if ldconfig -p 2>/dev/null | grep -q "libcuda.so" || [ -f /usr/lib/x86_64-linux-gnu/libcuda.so ] || [ -f /usr/local/cuda/lib64/libcuda.so ]; then
         log "✓ CUDA runtime libraries detected (LXC container or existing installation)."
         log "  Skipping CUDA toolkit installation to avoid conflicts."
-        log "  Installing GPU-enabled PyTorch that will use existing CUDA libraries..."
+        
+        # Display GPU info
+        if [ -n "$GPU_NAME" ]; then
+            log "  GPU: $GPU_NAME"
+        fi
+        if [ -n "$COMPUTE_CAP" ]; then
+            log "  Compute Capability: $COMPUTE_CAP"
+        fi
         
         # Display CUDA version if available
         if command -v nvcc &> /dev/null; then
             CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p')
-            log "  Detected CUDA version: $CUDA_VERSION"
+            log "  CUDA Toolkit: $CUDA_VERSION"
         fi
         
-        export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
-        PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        # Determine PyTorch CUDA version based on GPU compute capability
+        # Convert compute capability to comparable integer (e.g., 8.9 -> 89, 12.0 -> 120)
+        if [ -n "$COMPUTE_CAP" ]; then
+            CAP_MAJOR=$(echo "$COMPUTE_CAP" | cut -d'.' -f1)
+            CAP_MINOR=$(echo "$COMPUTE_CAP" | cut -d'.' -f2)
+            CAP_INT=$((CAP_MAJOR * 10 + CAP_MINOR))
+            
+            # sm_90+ (Ada Lovelace/Hopper/Blackwell) requires PyTorch CUDA 12.x
+            if [ "$CAP_INT" -ge 90 ]; then
+                log "  Detected modern GPU architecture (sm_${CAP_MAJOR}${CAP_MINOR})"
+                log "  Installing PyTorch with CUDA 12.4 support (for Ada/Hopper/Blackwell GPUs)..."
+                export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
+                PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124"
+            else
+                log "  Installing PyTorch with CUDA 11.8 support..."
+                export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
+                PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+            fi
+        else
+            # Fallback to CUDA 11.8 if compute capability cannot be detected
+            log "  Could not detect compute capability, defaulting to CUDA 11.8 PyTorch"
+            export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
+            PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        fi
         
     else
         log "NVIDIA driver found but no CUDA runtime libraries detected."
