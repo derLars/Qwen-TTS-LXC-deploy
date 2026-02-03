@@ -54,10 +54,33 @@ def unload_model():
     global active_model, active_model_name
     if active_model is not None:
         logger.info(f"MEMORY MANAGER: Unloading model '{active_model_name}' to free RAM.")
+        
+        # Log GPU memory before unload
+        if torch.cuda.is_available():
+            mem_allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"MEMORY MANAGER: GPU memory before unload - Allocated: {mem_allocated:.2f}GB, Reserved: {mem_reserved:.2f}GB")
+        
+        # Delete the model
         del active_model
         active_model = None
         active_model_name = None
+        
+        # Force Python garbage collection
         gc.collect()
+        
+        # CRITICAL: Clear PyTorch's CUDA cache to actually free GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+            
+            # Log GPU memory after unload
+            mem_allocated_after = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"MEMORY MANAGER: GPU memory after unload - Allocated: {mem_allocated_after:.2f}GB, Reserved: {mem_reserved_after:.2f}GB")
+            logger.info(f"MEMORY MANAGER: GPU memory freed - {mem_allocated - mem_allocated_after:.2f}GB allocated, {mem_reserved - mem_reserved_after:.2f}GB reserved")
+        
+        logger.info("MEMORY MANAGER: Model unloaded and GPU memory released.")
 
 def get_or_load_model(target_model_name: str):
     """

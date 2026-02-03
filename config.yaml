@@ -1,7 +1,7 @@
 server:
   host: "0.0.0.0"
   port: 8000
-  unload_timeout: 180
+  unload_timeout: 60
   request_timeout: 7200
 
 models:
