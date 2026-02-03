@@ -3,6 +3,8 @@
 # Exit on error
 set -e
 
+export DEBIAN_FRONTEND=noninteractive
+
 # --- Configuration ---
 APP_DIR="/opt/qwen-tts-server"
 GITHUB_REPO="https://github.com/derlars/Qwen-TTS-LXC-deploy/raw/main"
