@@ -16,31 +16,28 @@ log() {
 log "=== Starting Qwen3-TTS Server Installation/Update ==="
 
 # --- System Dependencies ---
-log "[1/6] Configuring APT sources..."
-CODENAME=$(cat /etc/os-release | grep VERSION_CODENAME | cut -d'=' -f2)
-cat <<EOF > /etc/apt/sources.list
-deb http://deb.debian.org/debian/ $CODENAME main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security $CODENAME-security main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian/ $CODENAME-updates main contrib non-free non-free-firmware
-EOF
-
 log "[1/6] Installing system dependencies..."
 apt-get update
+# The package 'software-properties-common' is not available in Debian 12/13 minimal installations.
+# The 'add-apt-repository' command is not needed as we are managing sources manually.
 apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
-    build-essential ffmpeg libsndfile1 git wget curl software-properties-common
+    build-essential ffmpeg libsndfile1 git wget curl
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
     log "[2/6] NVIDIA GPU detected. Installing CUDA and GPU-enabled PyTorch."
-    add-apt-repository contrib
-    add-apt-repository non-free
+    
+    # Enable contrib, non-free and non-free-firmware repositories
+    sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
+    
     apt-get update
     apt-get install -y nvidia-driver firmware-misc-nonfree
     
     # Add NVIDIA CUDA repository
     wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
     dpkg -i cuda-keyring_1.0-1_all.deb
+    rm cuda-keyring_1.0-1_all.deb
     apt-get update
     apt-get -y install cuda-toolkit-11-8
     
@@ -78,7 +75,7 @@ if [ ! -d "$APP_DIR/venv" ]; then
     log "[5/6] Creating Python virtual environment."
     python3 -m venv venv
 fi
-source vেনেরv/bin/activate
+source venv/bin/activate
 pip install --upgrade pip
 log "[5/6] Installing Python requirements..."
 $PIP_INSTALL_TORCH
