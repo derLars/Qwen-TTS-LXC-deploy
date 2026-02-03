@@ -120,6 +120,12 @@ def process_audio_output(outputs):
         # Tuple/list format (newer API)
         audio_data = outputs[0]
         sample_rate = outputs[1] if len(outputs) > 1 else 12000  # Default to 12kHz if not provided
+        
+        # Handle case where audio_data is a list containing the array
+        # (PyTorch nightly + newer Qwen3-TTS returns: [array(...)])
+        if isinstance(audio_data, list) and len(audio_data) > 0:
+            logger.debug(f"Audio data is a list with {len(audio_data)} elements, extracting first element")
+            audio_data = audio_data[0]
     else:
         logger.error(f"Unexpected output type from model: {type(outputs)}")
         raise TypeError(f"Model returned unexpected output type: {type(outputs)}")
@@ -131,7 +137,11 @@ def process_audio_output(outputs):
     # Squeeze extra dimensions if present
     if isinstance(audio_data, np.ndarray) and audio_data.ndim > 1:
         audio_data = audio_data.squeeze()
-        
+    
+    # Log final audio data shape for debugging
+    if isinstance(audio_data, np.ndarray):
+        logger.debug(f"Final audio shape: {audio_data.shape}, dtype: {audio_data.dtype}, sample_rate: {sample_rate}")
+    
     return audio_data, int(sample_rate)
 
 @app.on_event("startup")
