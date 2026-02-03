@@ -22,7 +22,7 @@ log "[1/6] Installing system dependencies..."
 apt-get update
 apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
-    build-essential ffmpeg libsndfile1 git wget curl
+    build-essential ffmpeg libsndfile1 git wget curl sox
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
