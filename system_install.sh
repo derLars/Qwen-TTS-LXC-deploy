@@ -26,26 +26,45 @@ apt-get install -y \
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
-    log "[2/6] NVIDIA GPU and driver detected. Installing CUDA Toolkit and GPU-enabled PyTorch."
+    log "[2/6] NVIDIA GPU detected."
     
-    # Enable contrib, non-free and non-free-firmware repositories
-    sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
-    
-    apt-get update
-    
-    echo "Acquire::AllowInsecureRepositories \"true\";" > /etc/apt/apt.conf.d/99-allow-insecure-repositories
-    echo "Acquire::AllowDowngradeToInsecureRepositories \"true\";" >> /etc/apt/apt.conf.d/99-allow-insecure-repositories
+    # Check if CUDA runtime libraries are already available (LXC/container with GPU passthrough)
+    if ldconfig -p 2>/dev/null | grep -q "libcuda.so" || [ -f /usr/lib/x86_64-linux-gnu/libcuda.so ] || [ -f /usr/local/cuda/lib64/libcuda.so ]; then
+        log "✓ CUDA runtime libraries detected (LXC container or existing installation)."
+        log "  Skipping CUDA toolkit installation to avoid conflicts."
+        log "  Installing GPU-enabled PyTorch that will use existing CUDA libraries..."
+        
+        # Display CUDA version if available
+        if command -v nvcc &> /dev/null; then
+            CUDA_VERSION=$(nvcc --version | grep "release" | sed -n 's/.*release \([0-9]\+\.[0-9]\+\).*/\1/p')
+            log "  Detected CUDA version: $CUDA_VERSION"
+        fi
+        
+        export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
+        PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        
+    else
+        log "NVIDIA driver found but no CUDA runtime libraries detected."
+        log "Installing CUDA Toolkit for bare-metal installation..."
+        
+        # Enable contrib, non-free and non-free-firmware repositories
+        sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
+        
+        apt-get update
+        
+        echo "Acquire::AllowInsecureRepositories \"true\";" > /etc/apt/apt.conf.d/99-allow-insecure-repositories
+        echo "Acquire::AllowDowngradeToInsecureRepositories \"true\";" >> /etc/apt/apt.conf.d/99-allow-insecure-repositories
 
-    # Add NVIDIA CUDA repository
-    # The debian11 repo is the latest one provided by NVIDIA that works for debian12+
-    wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
-    dpkg -i cuda-keyring_1.0-1_all.deb
-    rm cuda-keyring_1.0-1_all.deb
-    apt-get update
-    apt-get -y --allow-unauthenticated install cuda-toolkit-11-8
-    
-    export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6"
-    PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+        # Add NVIDIA CUDA repository
+        wget https://developer.download.nvidia.com/compute/cuda/repos/debian11/x86_64/cuda-keyring_1.0-1_all.deb
+        dpkg -i cuda-keyring_1.0-1_all.deb
+        rm cuda-keyring_1.0-1_all.deb
+        apt-get update
+        apt-get -y --allow-unauthenticated install cuda-toolkit-11-8
+        
+        export TORCH_CUDA_ARCH_LIST="7.0 7.5 8.0 8.6 8.9 9.0"
+        PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118"
+    fi
 else
     log "[2/6] No NVIDIA GPU detected. Using CPU-only PyTorch."
     PIP_INSTALL_TORCH="pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu"
@@ -105,6 +124,32 @@ EOF
 systemctl daemon-reload
 systemctl enable qwen-tts
 systemctl restart qwen-tts
+
+# --- GPU Verification ---
+if command -v nvidia-smi &> /dev/null; then
+    log "=== GPU Verification ==="
+    log "Verifying PyTorch can access the GPU..."
+    
+    # Test PyTorch CUDA availability
+    GPU_TEST_RESULT=$($APP_DIR/venv/bin/python3 -c "
+import torch
+print('PyTorch version:', torch.__version__)
+print('CUDA available:', torch.cuda.is_available())
+if torch.cuda.is_available():
+    print('CUDA version:', torch.version.cuda)
+    print('GPU device:', torch.cuda.get_device_name(0))
+    print('GPU count:', torch.cuda.device_count())
+" 2>&1)
+    
+    echo "$GPU_TEST_RESULT"
+    
+    if echo "$GPU_TEST_RESULT" | grep -q "CUDA available: True"; then
+        log "✓ GPU verification successful! PyTorch can access the GPU."
+    else
+        log "⚠ WARNING: PyTorch cannot access the GPU. Check your CUDA/driver installation."
+        log "  The server will run in CPU mode."
+    fi
+fi
 
 log "=== Installation/Update Complete ==="
 log "The service is now running and will start automatically on boot."
