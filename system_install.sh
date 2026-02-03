@@ -26,24 +26,12 @@ apt-get install -y \
 
 # --- GPU Detection and PyTorch Installation ---
 if command -v nvidia-smi &> /dev/null; then
-
-    log "[2/6] Forcibly removing conflicting NVIDIA packages..."
-    dpkg --remove --force-remove-reinstreq nvidia-installer-cleanup || true
-    apt-get remove --purge '^nvidia-.*' -y || true
-    apt-get autoremove -y || true
-
-    log "[2/6] NVIDIA GPU detected. Installing CUDA and GPU-enabled PyTorch."
+    log "[2/6] NVIDIA GPU and driver detected. Installing CUDA Toolkit."
     
     # Enable contrib, non-free and non-free-firmware repositories
     sed -i -e's/ main/ main contrib non-free non-free-firmware/g' /etc/apt/sources.list.d/debian.sources
     
     apt-get update
-    if ! dpkg -l | grep -q nvidia-driver; then
-        log "No existing NVIDIA driver found. Installing Debian package."
-        apt-get install -y nvidia-driver firmware-misc-nonfree
-    else
-        log "Existing NVIDIA driver found. Skipping installation."
-    fi
     
     # Add NVIDIA CUDA repository
     # The debian11 repo is the latest one provided by NVIDIA that works for debian12+
