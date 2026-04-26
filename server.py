@@ -1,5 +1,6 @@
 import os
 import shutil
+import hashlib
 import tempfile
 import torch
 import soundfile as sf
@@ -9,19 +10,28 @@ import gc
 import time
 import asyncio
 import yaml
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from contextlib import asynccontextmanager
+from typing import Optional
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 from qwen_tts import Qwen3TTSModel
 from loguru import logger
 
-# --- Configuration Loading ---
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 def load_config():
     with open("config.yaml", "r") as f:
         return yaml.safe_load(f)
 
 config = load_config()
 
-# --- Logger Configuration ---
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logger.add(
     config["logging"]["file"],
     level=config["logging"]["level"],
@@ -32,237 +42,561 @@ logger.add(
     diagnose=True,
 )
 
-# --- Device Configuration ---
+# ---------------------------------------------------------------------------
+# Device
+# ---------------------------------------------------------------------------
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 if DEVICE == "cpu":
     torch.set_num_threads(20)
 logger.info(f"Using device: {DEVICE}")
 
-# --- Model Configuration ---
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+
 MODELS = config["models"]
 UNLOAD_TIMEOUT = config["server"]["unload_timeout"]
 
-app = FastAPI(title="Qwen3-TTS Server")
+# ---------------------------------------------------------------------------
+# Global model state
+# ---------------------------------------------------------------------------
 
-# --- Global State for Memory Management ---
-active_model = None
+active_model      = None
 active_model_name = None
-last_access_time = 0
+last_access_time  = 0
+
+# Tracks concurrent in-flight requests so the inactivity monitor never
+# unloads the model while a generation is running.
+# asyncio is single-threaded: plain int mutation is safe here because
+# all mutations happen from the same event loop.
+_requests_in_flight: int = 0
+
+# Handle to the current background preload task (asyncio.Task), or None.
+# Used by /status to report preload progress.
+_preload_task_handle: Optional[asyncio.Task] = None
+
+# ---------------------------------------------------------------------------
+# Voice-clone prompt cache
+# Key = MD5(reference_audio_bytes + reference_text)
+# ---------------------------------------------------------------------------
+
+_voice_prompt_cache: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(inactivity_monitor())
+    yield
+
+
+app = FastAPI(title="Qwen3-TTS Server", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Model memory management
+# ---------------------------------------------------------------------------
 
 def unload_model():
-    """Unloads the currently active model and forces garbage collection."""
+    """Unloads the active model and releases GPU memory."""
     global active_model, active_model_name
-    if active_model is not None:
-        logger.info(f"MEMORY MANAGER: Unloading model '{active_model_name}' to free RAM.")
-        
-        # Log GPU memory before unload
-        if torch.cuda.is_available():
-            mem_allocated = torch.cuda.memory_allocated() / 1024**3  # Convert to GB
-            mem_reserved = torch.cuda.memory_reserved() / 1024**3
-            logger.info(f"MEMORY MANAGER: GPU memory before unload - Allocated: {mem_allocated:.2f}GB, Reserved: {mem_reserved:.2f}GB")
-        
-        # Delete the model
-        del active_model
-        active_model = None
-        active_model_name = None
-        
-        # Force Python garbage collection
-        gc.collect()
-        
-        # CRITICAL: Clear PyTorch's CUDA cache to actually free GPU memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()  # Wait for all CUDA operations to complete
-            
-            # Log GPU memory after unload
-            mem_allocated_after = torch.cuda.memory_allocated() / 1024**3
-            mem_reserved_after = torch.cuda.memory_reserved() / 1024**3
-            logger.info(f"MEMORY MANAGER: GPU memory after unload - Allocated: {mem_allocated_after:.2f}GB, Reserved: {mem_reserved_after:.2f}GB")
-            logger.info(f"MEMORY MANAGER: GPU memory freed - {mem_allocated - mem_allocated_after:.2f}GB allocated, {mem_reserved - mem_reserved_after:.2f}GB reserved")
-        
-        logger.info("MEMORY MANAGER: Model unloaded and GPU memory released.")
+    if active_model is None:
+        return
 
-def get_or_load_model(target_model_name: str):
+    logger.info(f"MEMORY MANAGER: Unloading model '{active_model_name}'.")
+
+    if torch.cuda.is_available():
+        mem_alloc = torch.cuda.memory_allocated() / 1024 ** 3
+        mem_rsrv  = torch.cuda.memory_reserved()   / 1024 ** 3
+        logger.info(
+            f"MEMORY MANAGER: GPU before unload — "
+            f"allocated {mem_alloc:.2f} GB, reserved {mem_rsrv:.2f} GB"
+        )
+
+    del active_model
+    active_model      = None
+    active_model_name = None
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_alloc_after = torch.cuda.memory_allocated() / 1024 ** 3
+        mem_rsrv_after  = torch.cuda.memory_reserved()   / 1024 ** 3
+        logger.info(
+            f"MEMORY MANAGER: GPU after unload — "
+            f"allocated {mem_alloc_after:.2f} GB, reserved {mem_rsrv_after:.2f} GB"
+        )
+
+    logger.info("MEMORY MANAGER: Model unloaded.")
+
+
+def get_or_load_model(target_model_name: str) -> Qwen3TTSModel:
     """
-    Retrieves the requested model.
-    1. If it's already loaded, updates timestamp and returns it.
-    2. If a different model is loaded, unloads it first.
-    3. Loads the requested model from disk.
+    Returns the requested model, loading (and optionally swapping) as needed.
+    All callers must increment/decrement _requests_in_flight around this call.
     """
     global active_model, active_model_name, last_access_time
-    
+
     last_access_time = time.time()
 
     if active_model_name == target_model_name and active_model is not None:
         return active_model
 
     if active_model is not None:
-        logger.info(f"MEMORY MANAGER: Switching models. Unloading '{active_model_name}'...")
+        logger.info(f"MEMORY MANAGER: Switching from '{active_model_name}' → '{target_model_name}'.")
         unload_model()
 
-    logger.info(f"MEMORY MANAGER: Loading '{target_model_name}' from disk...")
+    logger.info(f"MEMORY MANAGER: Loading '{target_model_name}' from disk…")
     try:
         model_id = MODELS[target_model_name]
         model = Qwen3TTSModel.from_pretrained(
             model_id,
             device_map=DEVICE,
-            torch_dtype=torch.float32
+            torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
-            
-        active_model = model
+        active_model      = model
         active_model_name = target_model_name
-        logger.info(f"MEMORY MANAGER: '{target_model_name}' loaded successfully.")
+        logger.info(f"MEMORY MANAGER: '{target_model_name}' loaded.")
         return active_model
     except Exception as e:
-        logger.error(f"CRITICAL ERROR loading model: {e}")
-        raise e
+        logger.error(f"CRITICAL: Failed to load model '{target_model_name}': {e}")
+        raise
+
 
 async def inactivity_monitor():
-    """Background task to unload models after inactivity."""
-    global active_model, last_access_time
+    """Unloads the model after a configurable idle period."""
     logger.info("MEMORY MANAGER: Inactivity monitor started.")
     while True:
         await asyncio.sleep(10)
-        if active_model is not None:
+        # Only unload when no request or preload is actively using the model.
+        if active_model is not None and _requests_in_flight == 0:
             elapsed = time.time() - last_access_time
             if elapsed > UNLOAD_TIMEOUT:
-                logger.info(f"MEMORY MANAGER: Inactivity detected ({elapsed:.1f}s > {UNLOAD_TIMEOUT}s).")
+                logger.info(
+                    f"MEMORY MANAGER: Idle {elapsed:.1f}s "
+                    f"(threshold {UNLOAD_TIMEOUT}s) — unloading."
+                )
                 unload_model()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_remove(path: str) -> None:
+    """Best-effort file removal used as BackgroundTask after responses."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        logger.warning(f"Could not remove temp file '{path}': {exc}")
+
 
 def process_audio_output(outputs):
     """
-    Helper to extract audio and sample rate safely from model outputs.
-    Handles both dict and tuple return formats for compatibility.
+    Extracts (audio_array, sample_rate) from model outputs.
+    Handles dict, tuple, and list return formats for forward-compatibility.
     """
-    # Handle different output formats
     if isinstance(outputs, dict):
-        # Dictionary format (older API)
-        audio_data = outputs["audio"]
+        audio_data  = outputs["audio"]
         sample_rate = outputs["sample_rate"]
     elif isinstance(outputs, (tuple, list)):
-        # Tuple/list format (newer API)
-        audio_data = outputs[0]
-        sample_rate = outputs[1] if len(outputs) > 1 else 12000  # Default to 12kHz if not provided
-        
-        # Handle case where audio_data is a list containing the array
-        # (PyTorch nightly + newer Qwen3-TTS returns: [array(...)])
-        if isinstance(audio_data, list) and len(audio_data) > 0:
-            logger.debug(f"Audio data is a list with {len(audio_data)} elements, extracting first element")
+        audio_data  = outputs[0]
+        sample_rate = outputs[1] if len(outputs) > 1 else 12000
+        if isinstance(audio_data, list) and audio_data:
+            logger.debug(f"Audio data is a list ({len(audio_data)} elements) — extracting first.")
             audio_data = audio_data[0]
     else:
-        logger.error(f"Unexpected output type from model: {type(outputs)}")
-        raise TypeError(f"Model returned unexpected output type: {type(outputs)}")
+        raise TypeError(f"Unexpected model output type: {type(outputs)}")
 
-    # Convert tensor to numpy if needed
     if isinstance(audio_data, torch.Tensor):
         audio_data = audio_data.detach().cpu().float().numpy()
-    
-    # Squeeze extra dimensions if present
+
     if isinstance(audio_data, np.ndarray) and audio_data.ndim > 1:
         audio_data = audio_data.squeeze()
-    
-    # Log final audio data shape for debugging
+
     if isinstance(audio_data, np.ndarray):
-        logger.debug(f"Final audio shape: {audio_data.shape}, dtype: {audio_data.dtype}, sample_rate: {sample_rate}")
-    
+        logger.debug(
+            f"Audio — shape: {audio_data.shape}, "
+            f"dtype: {audio_data.dtype}, sample_rate: {sample_rate}"
+        )
+
     return audio_data, int(sample_rate)
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(inactivity_monitor())
+
+def _gpu_warmup(model: Qwen3TTSModel, language: str = "en") -> None:
+    """
+    Runs a short silent/dummy generation to prime GPU CUDA kernels.
+
+    The first inference call always triggers kernel compilation for new tensor
+    shapes, which can add significant latency. Running a short dummy pass during
+    preload absorbs this cost before the real request arrives.
+    """
+    logger.info("PRELOAD: Running GPU kernel warm-up pass…")
+    t0 = time.perf_counter()
+    try:
+        _ = model.generate_voice_design(
+            text="Warm up.",
+            language=language,
+            instruct="neutral voice",
+        )
+    except Exception as exc:
+        # Warm-up is best-effort: if it fails, don't abort the preload.
+        logger.warning(f"PRELOAD: Warm-up pass failed (non-fatal): {exc}")
+    elapsed = time.perf_counter() - t0
+    logger.info(f"PRELOAD: Warm-up completed in {elapsed:.2f}s — kernels are hot.")
+
+
+# ---------------------------------------------------------------------------
+# Preload background coroutine
+# ---------------------------------------------------------------------------
+
+async def _run_preload(
+    model_name:     str,
+    ref_bytes:      Optional[bytes],
+    reference_text: Optional[str],
+    run_warmup:     bool,
+    warmup_language: str,
+):
+    """
+    Coroutine scheduled by /preload.
+
+    Execution sequence:
+      1. Load (or confirm already loaded) the requested model.
+      2. If reference audio + text supplied → pre-encode the voice-clone prompt
+         and store it in _voice_prompt_cache (keyed by MD5 of bytes + text).
+      3. If run_warmup=True → run a short dummy inference to prime GPU kernels.
+
+    Because this is an asyncio coroutine on a single-threaded event loop,
+    blocking calls here will block the loop temporarily — but the 202 response
+    has already been sent to the client, who is free to do other work (e.g.,
+    LLM text generation) in parallel.
+    """
+    global _requests_in_flight
+    _requests_in_flight += 1
+    try:
+        # ---- 1. Model load ------------------------------------------------
+        t_load = time.perf_counter()
+        model = get_or_load_model(model_name)
+        logger.info(
+            f"PRELOAD: '{model_name}' ready "
+            f"({time.perf_counter() - t_load:.2f}s)."
+        )
+
+        # ---- 2. Voice-clone prompt pre-encoding ---------------------------
+        if ref_bytes and reference_text and model_name.endswith("-clone"):
+            cache_key = hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()
+            if cache_key not in _voice_prompt_cache:
+                logger.info(f"PRELOAD: Encoding voice prompt [{cache_key[:8]}…]")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(ref_bytes)
+                    tmp_path = tmp.name
+                try:
+                    t_enc = time.perf_counter()
+                    _voice_prompt_cache[cache_key] = model.create_voice_clone_prompt(
+                        ref_audio=tmp_path,
+                        ref_text=reference_text,
+                    )
+                    logger.info(
+                        f"PRELOAD: Voice prompt cached [{cache_key[:8]}…] "
+                        f"({time.perf_counter() - t_enc:.2f}s)."
+                    )
+                finally:
+                    _safe_remove(tmp_path)
+            else:
+                logger.info(f"PRELOAD: Voice prompt already cached [{cache_key[:8]}…].")
+
+        # ---- 3. GPU kernel warm-up ----------------------------------------
+        if run_warmup:
+            _gpu_warmup(model, language=warmup_language)
+
+        logger.info(f"PRELOAD: All steps complete for '{model_name}'. Server is ready.")
+
+    except Exception as exc:
+        logger.error(f"PRELOAD: Failed for '{model_name}': {exc}")
+    finally:
+        _requests_in_flight -= 1
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/preload", status_code=202)
+async def preload(
+    model_type:      str           = Form(...),
+    model_size:      str           = Form(default="1.7b"),
+    reference_text:  Optional[str] = Form(default=None),
+    reference_audio: Optional[UploadFile] = File(default=None),
+    warmup:          bool          = Form(default=True),
+    warmup_language: str           = Form(default="en"),
+):
+    """
+    Pre-loads the model (and optionally pre-encodes a voice-clone prompt) so
+    that the actual TTS call incurs zero model-load latency.
+
+    Intended usage (client side):
+      1. Send POST /preload as soon as you know you'll need TTS.
+      2. Do your LLM text generation in parallel.
+      3. Send the actual /voice-clone (or /custom-voice) request — the model
+         is already loaded and warm.
+
+    Parameters
+    ----------
+    model_type : "clone" | "custom" | "design"
+    model_size : "0.6b" | "1.7b"  (ignored for model_type=design)
+    reference_text  : transcript of reference audio (voice-clone only)
+    reference_audio : reference WAV file (voice-clone only)
+        If both are supplied, the voice-clone prompt is pre-encoded and cached.
+        The subsequent /voice-clone call MUST use the same reference audio bytes
+        and reference_text for the cache to hit.
+    warmup : run a short dummy inference to prime GPU kernels (default: true)
+    warmup_language : language code for the warm-up pass (default: "en")
+    """
+    global _preload_task_handle
+
+    # Build the model name, mirroring the pattern used by generation endpoints.
+    if model_type == "design":
+        model_name = "1.7b-design"
+    else:
+        model_name = f"{model_size}-{model_type}"
+
+    if model_name not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown combination: model_type='{model_type}', model_size='{model_size}'.",
+        )
+
+    # Read reference audio bytes upfront (UploadFile is stream-backed).
+    ref_bytes = await reference_audio.read() if reference_audio else None
+
+    # If the same model is already loaded and no voice prompt is pending, skip.
+    prompt_needed = (
+        ref_bytes
+        and reference_text
+        and model_name.endswith("-clone")
+        and hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()
+        not in _voice_prompt_cache
+    )
+    if active_model_name == model_name and active_model is not None and not prompt_needed:
+        logger.info(f"PRELOAD: '{model_name}' already loaded — nothing to do.")
+        return {"status": "already_ready", "model": model_name}
+
+    # Cancel any existing preload task that is no longer relevant.
+    if _preload_task_handle and not _preload_task_handle.done():
+        logger.info("PRELOAD: Cancelling previous preload task.")
+        _preload_task_handle.cancel()
+
+    # Schedule the preload coroutine. The 202 response is sent to the client
+    # before this task begins executing, so the client is free to proceed.
+    _preload_task_handle = asyncio.create_task(
+        _run_preload(model_name, ref_bytes, reference_text, warmup, warmup_language)
+    )
+    _preload_task_handle.add_done_callback(
+        lambda t: logger.error(f"PRELOAD task raised: {t.exception()}")
+        if not t.cancelled() and t.exception()
+        else None
+    )
+
+    logger.info(f"PRELOAD: Task scheduled for '{model_name}'.")
+    return {
+        "status":      "loading",
+        "model":       model_name,
+        "warmup":      warmup,
+        "voice_prompt_preload": bool(ref_bytes and reference_text),
+    }
+
+
+@app.get("/status")
+async def status():
+    """
+    Returns the current server state: which model is loaded, whether a preload
+    is in progress, how many requests are in flight, and cache statistics.
+    """
+    preload_state = "idle"
+    if _preload_task_handle is not None:
+        if not _preload_task_handle.done():
+            preload_state = "loading"
+        elif _preload_task_handle.cancelled():
+            preload_state = "cancelled"
+        elif _preload_task_handle.exception():
+            preload_state = "failed"
+        else:
+            preload_state = "ready"
+
+    return {
+        "device":               DEVICE,
+        "model_loaded":         active_model is not None,
+        "model_name":           active_model_name,
+        "preload_state":        preload_state,
+        "requests_in_flight":   _requests_in_flight,
+        "voice_prompts_cached": len(_voice_prompt_cache),
+    }
+
 
 @app.post("/voice-design")
 async def voice_design(
+    background_tasks: BackgroundTasks,
     target_text: str = Form(...),
-    language: str = Form(...),
-    instruct: str = Form(...)
+    language:    str = Form(...),
+    instruct:    str = Form(...),
 ):
-    model = get_or_load_model("1.7b-design")
+    """
+    Generates a voice from a text description.
+    NOTE: The 1.7B model is used unconditionally — Qwen3-TTS does not
+    publish a 0.6B voice-design variant.
+    """
+    global _requests_in_flight
+    _requests_in_flight += 1
     output_filename = f"output_design_{os.urandom(4).hex()}.wav"
+    background_tasks.add_task(_safe_remove, output_filename)
     try:
-        logger.info(f"Processing Voice Design request: '{instruct}'")
+        model = get_or_load_model("1.7b-design")
+        logger.info(f"Voice Design — instruct: '{instruct}'")
         outputs = model.generate_voice_design(
             text=target_text,
             language=language,
-            instruct=instruct
+            instruct=instruct,
         )
         audio_data, sample_rate = process_audio_output(outputs)
         sf.write(output_filename, audio_data, sample_rate)
         return FileResponse(output_filename, media_type="audio/wav", filename="design_output.wav")
-    except Exception as e:
-        logger.error(f"Error during voice design: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error(f"Voice Design error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        _requests_in_flight -= 1
+
 
 @app.post("/custom-voice")
 async def custom_voice(
-    model_size: str = Form(...),
-    language: str = Form(...),
-    speaker: str = Form(...),
-    instruct: str = Form(...),
-    target_text: str = Form(...)
+    background_tasks: BackgroundTasks,
+    model_size:  str = Form(...),
+    language:    str = Form(...),
+    speaker:     str = Form(...),
+    instruct:    str = Form(...),
+    target_text: str = Form(...),
 ):
     model_name = f"{model_size}-custom"
     if model_name not in MODELS:
-        raise HTTPException(status_code=400, detail="Invalid model size for custom voice.")
-    
-    model = get_or_load_model(model_name)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model size '{model_size}' for custom voice.",
+        )
+
+    global _requests_in_flight
+    _requests_in_flight += 1
     output_filename = f"output_custom_{os.urandom(4).hex()}.wav"
+    background_tasks.add_task(_safe_remove, output_filename)
     try:
-        logger.info(f"Processing Custom Voice request for model: {model_name}")
+        model = get_or_load_model(model_name)
+        logger.info(f"Custom Voice — model: {model_name}, speaker: '{speaker}'")
         outputs = model.generate_custom_voice(
             text=target_text,
             language=language,
             speaker=speaker,
-            instruct=instruct
+            instruct=instruct,
         )
         audio_data, sample_rate = process_audio_output(outputs)
         sf.write(output_filename, audio_data, sample_rate)
         return FileResponse(output_filename, media_type="audio/wav", filename="custom_output.wav")
-    except Exception as e:
-        logger.error(f"Error during custom voice generation: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error(f"Custom Voice error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        _requests_in_flight -= 1
+
 
 @app.post("/voice-clone")
 async def voice_clone(
-    model_size: str = Form(...),
-    target_text: str = Form(...),
-    language: str = Form(...),
-    reference_text: str = Form(...),
-    reference_audio: UploadFile = File(...)
+    background_tasks: BackgroundTasks,
+    model_size:      str        = Form(...),
+    target_text:     str        = Form(...),
+    language:        str        = Form(...),
+    reference_text:  str        = Form(...),
+    reference_audio: UploadFile = File(...),
 ):
     model_name = f"{model_size}-clone"
     if model_name not in MODELS:
-        raise HTTPException(status_code=400, detail="Invalid model size for voice cloning.")
-        
-    model = get_or_load_model(model_name)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model size '{model_size}' for voice cloning.",
+        )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_ref:
-        shutil.copyfileobj(reference_audio.file, temp_ref)
-        temp_ref_path = temp_ref.name
+    # Read bytes once — used for both cache key and optional temp file.
+    ref_bytes = await reference_audio.read()
+    cache_key = hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()
 
+    global _requests_in_flight
+    _requests_in_flight += 1
     output_filename = f"output_clone_{os.urandom(4).hex()}.wav"
+    background_tasks.add_task(_safe_remove, output_filename)
     try:
-        logger.info(f"Processing Voice Clone request for model: {model_name}")
+        model = get_or_load_model(model_name)
+
+        # ------------------------------------------------------------------
+        # Voice-clone prompt: use cached entry from /preload if available,
+        # otherwise encode now (same logic as in _run_preload).
+        # ------------------------------------------------------------------
+        if cache_key not in _voice_prompt_cache:
+            logger.info(f"Voice Clone — cache miss [{cache_key[:8]}…], encoding reference.")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(ref_bytes)
+                tmp_path = tmp.name
+            try:
+                _voice_prompt_cache[cache_key] = model.create_voice_clone_prompt(
+                    ref_audio=tmp_path,
+                    ref_text=reference_text,
+                )
+            finally:
+                _safe_remove(tmp_path)
+        else:
+            logger.info(f"Voice Clone — cache hit [{cache_key[:8]}…].")
+
+        voice_prompt = _voice_prompt_cache[cache_key]
+
+        logger.info(f"Voice Clone — model: {model_name}, generating…")
         outputs = model.generate_voice_clone(
             text=target_text,
             language=language,
-            ref_audio=temp_ref_path, 
-            ref_text=reference_text
+            voice_clone_prompt=voice_prompt,
         )
         audio_data, sample_rate = process_audio_output(outputs)
         sf.write(output_filename, audio_data, sample_rate)
         return FileResponse(output_filename, media_type="audio/wav", filename="cloned_output.wav")
-    except Exception as e:
-        logger.error(f"Error during cloning: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error(f"Voice Clone error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
     finally:
-        if os.path.exists(temp_ref_path):
-            os.remove(temp_ref_path)
+        _requests_in_flight -= 1
+
+
+@app.delete("/voice-clone/cache")
+async def clear_voice_clone_cache():
+    """
+    Clears the in-memory voice-clone prompt cache. Call this after replacing
+    a speaker's reference audio so the next request re-encodes from the new file.
+    """
+    count = len(_voice_prompt_cache)
+    _voice_prompt_cache.clear()
+    logger.info(f"Voice Clone cache cleared ({count} entry/entries removed).")
+    return {"cleared": count}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run(
         app,
         host=config["server"]["host"],
         port=config["server"]["port"],
-        timeout_keep_alive=config["server"]["request_timeout"]
+        timeout_keep_alive=config["server"]["request_timeout"],
     )
