@@ -50,28 +50,227 @@ See [QUICK_START.md](QUICK_START.md) for detailed instructions.
 
 ## 🎯 API Endpoints
 
-### 1. Voice Design
-Create voices from text descriptions.
+All endpoints listen on `http://localhost:8000` (or your configured host/port).
+
+---
+
+### POST /preload
+
+**Pre-load models and cache voice prompts** to eliminate loading latency on the actual TTS request. Recommended for production use.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `model_type` | string | Yes | Type of TTS model | `"design"`, `"custom"`, `"clone"` |
+| `model_size` | string | No | Model size (ignored for design) | `"0.6b"`, `"1.7b"` (default: `"1.7b"`) |
+| `reference_text` | string | No | Transcript of reference audio | Any text matching the audio |
+| `reference_audio` | file | No | Reference WAV file for cloning | WAV audio file |
+| `warmup` | boolean | No | Run GPU kernel warm-up | `true` (default), `false` |
+| `warmup_language` | string | No | Language for warm-up pass | `"en"` (default), `"zh"`, etc. |
+
+**Example Request:**
 
 ```bash
-POST /voice-design
+# Preload voice-clone model with reference audio
+curl -X POST http://localhost:8000/preload \
+  -F "model_type=clone" \
+  -F "model_size=1.7b" \
+  -F "reference_text=This is my reference voice sample" \
+  -F "reference_audio=@reference.wav" \
+  -F "warmup=true"
 ```
 
-### 2. Custom Voice
-Generate speech with predefined voice characteristics.
+**Response (202 Accepted):**
+```json
+{
+  "status": "loading",
+  "model": "1.7b-clone",
+  "warmup": true,
+  "voice_prompt_preload": true
+}
+```
+
+---
+
+### GET /status
+
+**Check server status**, model state, and cache information.
+
+**Example Request:**
 
 ```bash
-POST /custom-voice
+curl http://localhost:8000/status
 ```
 
-### 3. Voice Clone
-Clone voices from reference audio samples.
+**Response:**
+```json
+{
+  "device": "cuda",
+  "model_loaded": true,
+  "model_name": "1.7b-clone",
+  "preload_state": "ready",
+  "requests_in_flight": 0,
+  "voice_prompts_cached": 2
+}
+```
+
+---
+
+### POST /voice-design
+
+**Generate speech from a text description** of desired voice characteristics. Only the 1.7B model is available for voice design.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `target_text` | string | Yes | Text to synthesize | Any text (max ~1000 chars recommended) |
+| `language` | string | Yes | Language code | `"en"`, `"zh"`, `"ja"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"` |
+| `instruct` | string | Yes | Voice characteristics description | e.g., `"cheerful young female voice"`, `"deep professional male voice"` |
+
+**Example Request:**
 
 ```bash
-POST /voice-clone
+curl -X POST http://localhost:8000/voice-design \
+  -F "target_text=Hello! Welcome to our text-to-speech demonstration." \
+  -F "language=en" \
+  -F "instruct=cheerful young female voice with clear pronunciation and friendly tone" \
+  -o output_design.wav
 ```
 
-See [QUICK_START.md](QUICK_START.md) for API usage examples.
+**Response:** WAV audio file
+
+**Instruct Examples:**
+- `"cheerful young female voice with energetic tone"`
+- `"deep authoritative male voice, professional broadcaster"`
+- `"soft gentle female voice, calm and soothing"`
+- `"enthusiastic male voice with upbeat personality"`
+
+---
+
+### POST /custom-voice
+
+**Generate speech with predefined voice characteristics** from the model's built-in speaker set.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `model_size` | string | Yes | Model size | `"0.6b"`, `"1.7b"` |
+| `language` | string | Yes | Language code | `"en"`, `"zh"`, `"ja"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"` |
+| `speaker` | string | Yes | Speaker identifier | `"male_1"`, `"female_1"`, etc. (model-dependent) |
+| `instruct` | string | Yes | Voice modification instructions | e.g., `"speak slowly and clearly"`, `"excited and energetic"` |
+| `target_text` | string | Yes | Text to synthesize | Any text (max ~1000 chars recommended) |
+
+**Example Request:**
+
+```bash
+curl -X POST http://localhost:8000/custom-voice \
+  -F "model_size=1.7b" \
+  -F "language=en" \
+  -F "speaker=female_1" \
+  -F "instruct=speak with clear pronunciation and moderate pace" \
+  -F "target_text=This is a demonstration of custom voice synthesis." \
+  -o output_custom.wav
+```
+
+**Response:** WAV audio file
+
+**Instruct Examples:**
+- `"speak slowly with emphasis on clarity"`
+- `"energetic and enthusiastic delivery"`
+- `"calm and professional tone"`
+- `"dramatic reading with emotion"`
+
+---
+
+### POST /voice-clone
+
+**Clone a voice from a reference audio sample** and generate speech in that voice.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `model_size` | string | Yes | Model size | `"0.6b"`, `"1.7b"` |
+| `target_text` | string | Yes | Text to synthesize in cloned voice | Any text (max ~1000 chars recommended) |
+| `language` | string | Yes | Language code | `"en"`, `"zh"`, `"ja"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"` |
+| `reference_text` | string | Yes | Transcript of the reference audio | Exact words spoken in reference audio |
+| `reference_audio` | file | Yes | Reference audio file | WAV format, 3-10 seconds, clean audio recommended |
+
+**Example Request:**
+
+```bash
+curl -X POST http://localhost:8000/voice-clone \
+  -F "model_size=1.7b" \
+  -F "target_text=Hello, this is a test of the voice cloning system." \
+  -F "language=en" \
+  -F "reference_text=This is my voice speaking clearly" \
+  -F "reference_audio=@/path/to/reference.wav" \
+  -o output_clone.wav
+```
+
+**Response:** WAV audio file
+
+**Tips:**
+- Use 3-10 seconds of clean reference audio
+- Reference text must match what's spoken in the audio
+- Higher quality reference audio = better cloning results
+- Use `/preload` endpoint to pre-encode voice prompts for faster generation
+
+---
+
+### DELETE /voice-clone/cache
+
+**Clear the voice-clone prompt cache**. Call this after updating reference audio files to force re-encoding.
+
+**Example Request:**
+
+```bash
+curl -X DELETE http://localhost:8000/voice-clone/cache
+```
+
+**Response:**
+```json
+{
+  "cleared": 3
+}
+```
+
+---
+
+## 📝 API Usage Notes
+
+### Language Codes
+Supported languages include:
+- `en` - English
+- `zh` - Chinese (Mandarin)
+- `ja` - Japanese
+- `fr` - French
+- `de` - German
+- `es` - Spanish
+- `pt` - Portuguese
+- `ar` - Arabic
+- `hi` - Hindi
+
+### Audio Requirements
+- **Format**: WAV (recommended)
+- **Sample Rate**: 12kHz output (automatically handled)
+- **Reference Audio**: 3-10 seconds of clean speech for best cloning results
+
+### Performance Optimization
+1. Use `/preload` before making actual TTS requests
+2. Keep model sizes consistent (avoid switching between 0.6b/1.7b)
+3. Voice-clone prompts are automatically cached (keyed by audio+text hash)
+4. Models auto-unload after 60 seconds of inactivity (configurable)
+
+### Error Handling
+All endpoints return:
+- `200 OK` - Success (with audio file or JSON response)
+- `202 Accepted` - Preload accepted (processing in background)
+- `400 Bad Request` - Invalid parameters
+- `500 Internal Server Error` - Processing error (check logs)
 
 ## 🐛 Troubleshooting
 
