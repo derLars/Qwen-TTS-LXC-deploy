@@ -83,6 +83,14 @@ _preload_task_handle: Optional[asyncio.Task] = None
 
 _voice_prompt_cache: dict = {}
 
+# ---------------------------------------------------------------------------
+# Default voice references (persistent per model)
+# Key = model_name (e.g., "1.7b-clone")
+# ---------------------------------------------------------------------------
+
+_default_voice_prompts: dict = {}  # Stores the actual voice_clone_prompt
+_default_voice_metadata: dict = {}  # Stores {id, reference_text_preview}
+
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -417,7 +425,8 @@ async def preload(
 async def status():
     """
     Returns the current server state: which model is loaded, whether a preload
-    is in progress, how many requests are in flight, and cache statistics.
+    is in progress, how many requests are in flight, cache statistics, and
+    default reference information.
     """
     preload_state = "idle"
     if _preload_task_handle is not None:
@@ -430,6 +439,14 @@ async def status():
         else:
             preload_state = "ready"
 
+    # Build default references info
+    default_refs = {}
+    for model_name, metadata in _default_voice_metadata.items():
+        default_refs[model_name] = {
+            "id": metadata["id"],
+            "reference_text_preview": metadata["reference_text_preview"]
+        }
+
     return {
         "device":               DEVICE,
         "model_loaded":         active_model is not None,
@@ -437,6 +454,7 @@ async def status():
         "preload_state":        preload_state,
         "requests_in_flight":   _requests_in_flight,
         "voice_prompts_cached": len(_voice_prompt_cache),
+        "default_references":   default_refs,
     }
 
 
@@ -513,15 +531,112 @@ async def custom_voice(
         _requests_in_flight -= 1
 
 
-@app.post("/voice-clone")
-async def voice_clone(
-    background_tasks: BackgroundTasks,
+@app.post("/voice-clone/set-reference")
+async def set_default_reference(
     model_size:      str        = Form(...),
-    target_text:     str        = Form(...),
-    language:        str        = Form(...),
     reference_text:  str        = Form(...),
     reference_audio: UploadFile = File(...),
 ):
+    """
+    Set a default reference voice for the specified model that will be used
+    for all subsequent /voice-clone calls that don't provide their own reference.
+    
+    This eliminates the need to upload reference audio on every voice-clone request.
+    
+    Parameters
+    ----------
+    model_size : "0.6b" | "1.7b"
+    reference_text : transcript of the reference audio
+    reference_audio : reference WAV file (3-10 seconds recommended)
+    
+    Returns
+    -------
+    JSON with status, reference_id, and confirmation message
+    """
+    model_name = f"{model_size}-clone"
+    if model_name not in MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model size '{model_size}' for voice cloning.",
+        )
+    
+    global _requests_in_flight
+    _requests_in_flight += 1
+    
+    try:
+        # Load the model
+        model = get_or_load_model(model_name)
+        
+        # Read reference audio bytes
+        ref_bytes = await reference_audio.read()
+        
+        # Generate a short ID for this reference
+        ref_id = hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()[:8]
+        
+        # Create voice clone prompt
+        logger.info(f"Setting default reference for '{model_name}' [ID: {ref_id}]")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(ref_bytes)
+            tmp_path = tmp.name
+        
+        try:
+            voice_prompt = model.create_voice_clone_prompt(
+                ref_audio=tmp_path,
+                ref_text=reference_text,
+            )
+            
+            # Store the default voice prompt and metadata
+            _default_voice_prompts[model_name] = voice_prompt
+            _default_voice_metadata[model_name] = {
+                "id": ref_id,
+                "reference_text_preview": reference_text[:50] + ("..." if len(reference_text) > 50 else "")
+            }
+            
+            logger.info(f"Default reference set for '{model_name}' [ID: {ref_id}]")
+            
+            return {
+                "status": "success",
+                "model": model_name,
+                "reference_id": ref_id,
+                "message": f"Default reference set for {model_name} model"
+            }
+        finally:
+            _safe_remove(tmp_path)
+            
+    except Exception as exc:
+        logger.error(f"Set default reference error: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        _requests_in_flight -= 1
+
+
+@app.post("/voice-clone")
+async def voice_clone(
+    background_tasks: BackgroundTasks,
+    model_size:      str                = Form(...),
+    target_text:     str                = Form(...),
+    language:        str                = Form(...),
+    reference_text:  Optional[str]      = Form(default=None),
+    reference_audio: Optional[UploadFile] = File(default=None),
+):
+    """
+    Clone a voice and generate speech. Reference audio/text can be provided inline
+    or omitted to use the default reference set via /voice-clone/set-reference.
+    
+    Parameters
+    ----------
+    model_size : "0.6b" | "1.7b"
+    target_text : text to synthesize in the cloned voice
+    language : language code (e.g., "en", "zh")
+    reference_text : (optional) transcript of reference audio. If omitted, uses default.
+    reference_audio : (optional) reference audio file. If omitted, uses default.
+    
+    Behavior
+    --------
+    - Both reference_audio and reference_text provided → use them (override default)
+    - Neither provided → use default reference (must be set first)
+    - Only one provided → error (must provide both or neither)
+    """
     model_name = f"{model_size}-clone"
     if model_name not in MODELS:
         raise HTTPException(
@@ -529,38 +644,67 @@ async def voice_clone(
             detail=f"Unknown model size '{model_size}' for voice cloning.",
         )
 
-    # Read bytes once — used for both cache key and optional temp file.
-    ref_bytes = await reference_audio.read()
-    cache_key = hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()
-
+    # Determine if using provided reference or default
+    has_ref_audio = reference_audio is not None
+    has_ref_text = reference_text is not None
+    
+    # Validate: must provide both or neither
+    if has_ref_audio != has_ref_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Must provide both reference_audio and reference_text, or neither (to use default)."
+        )
+    
+    use_default = not has_ref_audio and not has_ref_text
+    
     global _requests_in_flight
     _requests_in_flight += 1
     output_filename = f"output_clone_{os.urandom(4).hex()}.wav"
     background_tasks.add_task(_safe_remove, output_filename)
+    
     try:
         model = get_or_load_model(model_name)
 
         # ------------------------------------------------------------------
-        # Voice-clone prompt: use cached entry from /preload if available,
-        # otherwise encode now (same logic as in _run_preload).
+        # Determine voice prompt source
         # ------------------------------------------------------------------
-        if cache_key not in _voice_prompt_cache:
-            logger.info(f"Voice Clone — cache miss [{cache_key[:8]}…], encoding reference.")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                tmp.write(ref_bytes)
-                tmp_path = tmp.name
-            try:
-                _voice_prompt_cache[cache_key] = model.create_voice_clone_prompt(
-                    ref_audio=tmp_path,
-                    ref_text=reference_text,
+        if use_default:
+            # Use default reference
+            if model_name not in _default_voice_prompts:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No default reference set for {model_name}. Use /voice-clone/set-reference first."
                 )
-            finally:
-                _safe_remove(tmp_path)
+            
+            voice_prompt = _default_voice_prompts[model_name]
+            ref_id = _default_voice_metadata[model_name]["id"]
+            logger.info(f"Voice Clone — using default reference [ID: {ref_id}] for {model_name}")
+        
         else:
-            logger.info(f"Voice Clone — cache hit [{cache_key[:8]}…].")
+            # Use provided reference (inline)
+            ref_bytes = await reference_audio.read()
+            cache_key = hashlib.md5(ref_bytes + reference_text.encode()).hexdigest()
+            
+            if cache_key not in _voice_prompt_cache:
+                logger.info(f"Voice Clone — cache miss [{cache_key[:8]}…], encoding reference.")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(ref_bytes)
+                    tmp_path = tmp.name
+                try:
+                    _voice_prompt_cache[cache_key] = model.create_voice_clone_prompt(
+                        ref_audio=tmp_path,
+                        ref_text=reference_text,
+                    )
+                finally:
+                    _safe_remove(tmp_path)
+            else:
+                logger.info(f"Voice Clone — cache hit [{cache_key[:8]}…].")
+            
+            voice_prompt = _voice_prompt_cache[cache_key]
 
-        voice_prompt = _voice_prompt_cache[cache_key]
-
+        # ------------------------------------------------------------------
+        # Generate speech
+        # ------------------------------------------------------------------
         logger.info(f"Voice Clone — model: {model_name}, generating…")
         outputs = model.generate_voice_clone(
             text=target_text,
@@ -570,6 +714,7 @@ async def voice_clone(
         audio_data, sample_rate = process_audio_output(outputs)
         sf.write(output_filename, audio_data, sample_rate)
         return FileResponse(output_filename, media_type="audio/wav", filename="cloned_output.wav")
+        
     except Exception as exc:
         logger.error(f"Voice Clone error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -578,15 +723,41 @@ async def voice_clone(
 
 
 @app.delete("/voice-clone/cache")
-async def clear_voice_clone_cache():
+async def clear_voice_clone_cache(clear_defaults: bool = False):
     """
-    Clears the in-memory voice-clone prompt cache. Call this after replacing
-    a speaker's reference audio so the next request re-encodes from the new file.
+    Clears the in-memory voice-clone prompt cache. Optionally clears default
+    references as well.
+    
+    Parameters
+    ----------
+    clear_defaults : bool (query parameter)
+        If True, also clears all default references set via /voice-clone/set-reference
+        Default: False
+    
+    Example
+    -------
+    DELETE /voice-clone/cache              # Clear only cache
+    DELETE /voice-clone/cache?clear_defaults=true  # Clear cache and defaults
     """
-    count = len(_voice_prompt_cache)
+    cache_count = len(_voice_prompt_cache)
     _voice_prompt_cache.clear()
-    logger.info(f"Voice Clone cache cleared ({count} entry/entries removed).")
-    return {"cleared": count}
+    
+    defaults_count = 0
+    if clear_defaults:
+        defaults_count = len(_default_voice_prompts)
+        _default_voice_prompts.clear()
+        _default_voice_metadata.clear()
+        logger.info(f"Voice Clone cache and defaults cleared ({cache_count} cached, {defaults_count} defaults removed).")
+        return {
+            "cache_cleared": cache_count,
+            "defaults_cleared": defaults_count
+        }
+    else:
+        logger.info(f"Voice Clone cache cleared ({cache_count} entry/entries removed).")
+        return {
+            "cache_cleared": cache_count,
+            "defaults_cleared": 0
+        }
 
 
 # ---------------------------------------------------------------------------

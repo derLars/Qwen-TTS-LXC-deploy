@@ -95,7 +95,7 @@ curl -X POST http://localhost:8000/preload \
 
 ### GET /status
 
-**Check server status**, model state, and cache information.
+**Check server status**, model state, cache information, and default reference details.
 
 **Example Request:**
 
@@ -111,7 +111,13 @@ curl http://localhost:8000/status
   "model_name": "1.7b-clone",
   "preload_state": "ready",
   "requests_in_flight": 0,
-  "voice_prompts_cached": 2
+  "voice_prompts_cached": 2,
+  "default_references": {
+    "1.7b-clone": {
+      "id": "a3f7b2c1",
+      "reference_text_preview": "This is my voice speaking clearly"
+    }
+  }
 }
 ```
 
@@ -185,9 +191,49 @@ curl -X POST http://localhost:8000/custom-voice \
 
 ---
 
+### POST /voice-clone/set-reference
+
+**Set a default reference voice** that persists across multiple voice-clone requests. This eliminates the need to upload reference audio on every request.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `model_size` | string | Yes | Model size | `"0.6b"`, `"1.7b"` |
+| `reference_text` | string | Yes | Transcript of the reference audio | Exact words spoken in reference audio |
+| `reference_audio` | file | Yes | Reference audio file | WAV format, 3-10 seconds, clean audio recommended |
+
+**Example Request:**
+
+```bash
+# Set default reference once
+curl -X POST http://localhost:8000/voice-clone/set-reference \
+  -F "model_size=1.7b" \
+  -F "reference_text=This is my voice speaking clearly" \
+  -F "reference_audio=@/path/to/reference.wav"
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "model": "1.7b-clone",
+  "reference_id": "a3f7b2c1",
+  "message": "Default reference set for 1.7b-clone model"
+}
+```
+
+**Benefits:**
+- Set once, use many times without re-uploading
+- Per-model defaults (0.6b and 1.7b can have different defaults)
+- Persists until server restart or manually cleared
+- Ideal for production with consistent voice identity
+
+---
+
 ### POST /voice-clone
 
-**Clone a voice from a reference audio sample** and generate speech in that voice.
+**Clone a voice and generate speech.** Reference audio/text can be provided inline or omitted to use the default reference set via `/voice-clone/set-reference`.
 
 **Parameters:**
 
@@ -196,10 +242,15 @@ curl -X POST http://localhost:8000/custom-voice \
 | `model_size` | string | Yes | Model size | `"0.6b"`, `"1.7b"` |
 | `target_text` | string | Yes | Text to synthesize in cloned voice | Any text (max ~1000 chars recommended) |
 | `language` | string | Yes | Language code | `"en"`, `"zh"`, `"ja"`, `"fr"`, `"de"`, `"es"`, `"pt"`, `"ar"`, `"hi"` |
-| `reference_text` | string | Yes | Transcript of the reference audio | Exact words spoken in reference audio |
-| `reference_audio` | file | Yes | Reference audio file | WAV format, 3-10 seconds, clean audio recommended |
+| `reference_text` | string | **Optional** | Transcript of the reference audio | Exact words spoken in reference audio |
+| `reference_audio` | file | **Optional** | Reference audio file | WAV format, 3-10 seconds, clean audio recommended |
 
-**Example Request:**
+**Behavior:**
+- **Both** `reference_audio` and `reference_text` provided → uses them (overrides default)
+- **Neither** provided → uses default reference (must be set first via `/voice-clone/set-reference`)
+- **Only one** provided → returns error (must provide both or neither)
+
+**Example Request (with inline reference):**
 
 ```bash
 curl -X POST http://localhost:8000/voice-clone \
@@ -211,21 +262,51 @@ curl -X POST http://localhost:8000/voice-clone \
   -o output_clone.wav
 ```
 
+**Example Request (using default reference):**
+
+```bash
+# First, set the default reference (once)
+curl -X POST http://localhost:8000/voice-clone/set-reference \
+  -F "model_size=1.7b" \
+  -F "reference_text=This is my voice speaking clearly" \
+  -F "reference_audio=@/path/to/reference.wav"
+
+# Then use voice-clone WITHOUT reference parameters (many times)
+curl -X POST http://localhost:8000/voice-clone \
+  -F "model_size=1.7b" \
+  -F "target_text=Hello, this is message one." \
+  -F "language=en" \
+  -o message1.wav
+
+curl -X POST http://localhost:8000/voice-clone \
+  -F "model_size=1.7b" \
+  -F "target_text=Hello, this is message two." \
+  -F "language=en" \
+  -o message2.wav
+```
+
 **Response:** WAV audio file
 
 **Tips:**
 - Use 3-10 seconds of clean reference audio
 - Reference text must match what's spoken in the audio
 - Higher quality reference audio = better cloning results
-- Use `/preload` endpoint to pre-encode voice prompts for faster generation
+- Use `/voice-clone/set-reference` for production workflows with consistent voices
+- Use inline reference for one-off cloning or testing different voices
 
 ---
 
 ### DELETE /voice-clone/cache
 
-**Clear the voice-clone prompt cache**. Call this after updating reference audio files to force re-encoding.
+**Clear the voice-clone prompt cache**. Optionally clear default references as well.
 
-**Example Request:**
+**Parameters:**
+
+| Parameter | Type | Required | Description | Valid Values |
+|-----------|------|----------|-------------|--------------|
+| `clear_defaults` | boolean | No | Also clear default references | `true`, `false` (default) |
+
+**Example Request (clear cache only):**
 
 ```bash
 curl -X DELETE http://localhost:8000/voice-clone/cache
@@ -234,9 +315,28 @@ curl -X DELETE http://localhost:8000/voice-clone/cache
 **Response:**
 ```json
 {
-  "cleared": 3
+  "cache_cleared": 3,
+  "defaults_cleared": 0
 }
 ```
+
+**Example Request (clear cache and defaults):**
+
+```bash
+curl -X DELETE "http://localhost:8000/voice-clone/cache?clear_defaults=true"
+```
+
+**Response:**
+```json
+{
+  "cache_cleared": 3,
+  "defaults_cleared": 2
+}
+```
+
+**Use Cases:**
+- Clear cache only: When you want to force re-encoding but keep default references
+- Clear both: When changing reference audio and want to reset everything
 
 ---
 
